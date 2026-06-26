@@ -84,11 +84,15 @@ public:
     // 尝试获取 fd 并完成对接。成功返回 true。
     bool open();
 
+    // 最近一次错误描述（诊断用）
+    std::string lastError() const { return last_err_; }
+
 private:
     int fd_ = -1;
     bool touch_ready_ = false;
     bool gyro_ready_ = false;
     std::vector<int> active_slots_;  // 当前处于按下状态的 slot
+    std::string last_err_;
 
     int syscallGetFd();
     int findFdFromProc();
@@ -145,5 +149,9 @@ public:
 
     static const char* typeName(DriverType t);
 };
+
+// 驱动探测诊断日志（probe() 调用后可读取，含每步成功/失败原因）
+const std::string& driverDiagnosticLog();
+void clearDriverDiagnosticLog();
 
 } // namespace kma

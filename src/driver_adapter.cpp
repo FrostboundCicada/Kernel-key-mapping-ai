@@ -81,25 +81,39 @@ TwtDriver::~TwtDriver() {
 
 // 通过 syscall(__NR_reboot) 携带 TwT magic 获取驱动 fd。
 // TwT 内核模块 hook 了 reboot 系统调用，识别 magic 后把 fd 写入 arg 指向地址。
+// 返回 fd(>=0) 或 -1（失败时 last_err_ 记录 errno）。
 int TwtDriver::syscallGetFd() {
 #if TWT_HAS_SYSCALL
     int fd = -1;
-    long ret;
+    errno = 0;
     register long _x0 __asm__("x0") = 0x114514;
     register long _x1 __asm__("x1") = 0x1919810;
     register long _x2 __asm__("x2") = 0x2778;
     register long _x3 __asm__("x3") = (long)&fd;
     register long _x8 __asm__("x8") = __NR_reboot;
+    // 注意：x0 既是入参(magic1) 又是返回值，必须用 "+r"(read-write) 约束，
+    //       否则编译器可能把入参和返回值分配到不同寄存器，导致 syscall 看到的
+    //       magic1 不是 0x114514，TwT hook 不识别 → fd 不会被写入。
     __asm__ __volatile__(
         "svc #0"
-        : "=r"(_x0)
-        : "r"(_x0), "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x8)
+        : "+r"(_x0)
+        : "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x8)
         : "memory", "cc"
     );
-    ret = _x0;
-    (void)ret;
-    return fd;
+    long ret = _x0;
+    int saved_errno = errno;
+    if (fd >= 0) {
+        return fd;
+    }
+    // fd 未被写入 → TwT hook 没有接管这次 reboot 调用
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "syscall(__NR_reboot) 未被 TwT hook 接管 (ret=%ld errno=%d:%s)",
+             ret, saved_errno, strerror(saved_errno));
+    last_err_ = buf;
+    return -1;
 #else
+    last_err_ = "非 aarch64 架构，不支持 TwT syscall 对接";
     return -1;
 #endif
 }
@@ -123,12 +137,22 @@ int TwtDriver::findFdFromProc() {
         }
     }
     closedir(dir);
+    if (found < 0) last_err_ = "/proc/self/fd 中未找到 anon_inode:...TwT_driver 链接";
     return found;
 }
 
 bool TwtDriver::open() {
+    last_err_.clear();
     fd_ = syscallGetFd();
-    if (fd_ < 0) fd_ = findFdFromProc();
+    if (fd_ < 0) {
+        std::string syscall_err = last_err_;
+        fd_ = findFdFromProc();
+        if (fd_ < 0) {
+            // 两种方式都失败，保留第一次的诊断信息（syscall 失败原因更有参考价值）
+            if (!syscall_err.empty()) last_err_ = syscall_err;
+            return false;
+        }
+    }
     return fd_ >= 0;
 }
 
@@ -288,22 +312,62 @@ void InputHandleDriver::touchUpAll() {
 //  DriverManager
 // ════════════════════════════════════════════════════════════
 
+// 全局诊断缓冲（供 JNI 读取）
+static std::string g_diag_log;
+
+static void diagAppend(const std::string& s) {
+    g_diag_log += s + "\n";
+}
+
+const std::string& driverDiagnosticLog() { return g_diag_log; }
+void clearDriverDiagnosticLog() { g_diag_log.clear(); }
+
 ITouchDriver* DriverManager::probe(DriverType preferred, int screen_w, int screen_h) {
+    g_diag_log.clear();
+    diagAppend("=== 驱动探测诊断 ===");
+    diagAppend("架构: " + std::string(
+#if TWT_HAS_SYSCALL
+        "aarch64 (支持 TwT syscall)"
+#else
+        "非 aarch64 (不支持 TwT syscall)"
+#endif
+    ));
+    {
+        // 列出 /dev 下已知驱动节点
+        std::string nodes = "已知驱动节点: ";
+        bool any = false;
+        for (const char* path : kInputHandleNodes) {
+            if (access(path, F_OK) == 0) { nodes += std::string(path) + " "; any = true; }
+        }
+        diagAppend(any ? nodes : nodes + "(无)");
+    }
+
     auto tryTwt = []() -> ITouchDriver* {
+        diagAppend("[尝试 TwT]");
         auto* d = new TwtDriver();
         if (d->open()) {
+            diagAppend("  TwT open() 成功, fd=" + std::to_string(0));
             // 尝试触摸方案二（方案一已被部分游戏特征）
-            if (!d->touchInit(1)) d->touchInit(0);
+            if (!d->touchInit(1)) {
+                diagAppend("  touchInit(1) 失败, 尝试 (0)");
+                d->touchInit(0);
+            }
             // 陀螺仪方案二
             d->gyroInit(1);
             return d;
         }
+        diagAppend("  TwT open() 失败: " + d->lastError());
         delete d;
         return nullptr;
     };
     auto tryInputHandle = [screen_w, screen_h]() -> ITouchDriver* {
+        diagAppend("[尝试 InputHandle 风格]");
         auto* d = new InputHandleDriver();
-        if (d->open(screen_w, screen_h)) return d;
+        if (d->open(screen_w, screen_h)) {
+            diagAppend(std::string("  InputHandle open() 成功: ") + d->name());
+            return d;
+        }
+        diagAppend("  InputHandle open() 失败 (无可用 /dev/*_touch 节点或权限不足)");
         delete d;
         return nullptr;
     };
@@ -319,6 +383,7 @@ ITouchDriver* DriverManager::probe(DriverType preferred, int screen_w, int scree
         if (auto* d = tryTwt()) return d;
         if (auto* d = tryInputHandle()) return d;
     }
+    diagAppend("=== 所有驱动均未对接 ===");
     return nullptr;
 }
 

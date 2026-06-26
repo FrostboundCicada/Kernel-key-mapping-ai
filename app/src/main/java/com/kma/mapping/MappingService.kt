@@ -1,6 +1,5 @@
 package com.kma.mapping
 
-import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,14 +7,19 @@ import android.app.Service
 import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.text.InputType
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.abs
@@ -24,11 +28,15 @@ import kotlin.math.abs
  * 悬浮窗映射服务。
  *
  * 生命周期与输入监听:
- *   - onCreate: 立即 setKeyCallback + nativeStartInput
+ *   - onCreate: 后台线程执行 RootShell.grantDevPermissions() → nativeStartInput
  *     → 服务一启动，物理按键就能被捕获用于"待选择"绑定（无需先开始映射）
  *   - "开始映射": nativeInitDriver(显示驱动状态) + nativeStartMapping
+ *     失败时弹出诊断面板（含 native 诊断日志 + lsmod + /dev 节点权限）
  *   - "停止映射": nativeStopMapping（输入监听保留，绑定仍可用）
  *   - onDestroy: nativeStopMapping + nativeStopInput + 移除所有悬浮 view
+ *
+ * 对话框实现: Service 上下文无法直接弹 AlertDialog（BadTokenException），
+ *   所有"对话框"改用 WindowManager 悬浮 view 实现，避免闪退。
  *
  * 悬浮窗管理: 所有 view 加入 allViews，onDestroy 统一清理，避免残留。
  */
@@ -44,8 +52,10 @@ class MappingService : Service() {
     private var screenHeight = 2400
     private var mappingStarted = false
     private var inputStarted = false
+    private var rootGranted = false
     private var driverName: String = ""
     private lateinit var statusText: TextView           // 面板上的状态显示
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // native 回调（物理按键，用于"待选择"绑定捕获）
     private val keyCallback = object : NativeBridge.KeyCallback {
@@ -72,11 +82,20 @@ class MappingService : Service() {
         screenWidth = dm.widthPixels
         screenHeight = dm.heightPixels
 
-        // 服务启动即开始输入监听 → 绑定随时可用
+        // 设置回调（即使输入监听还没启动也先注册，启动后立即生效）
         NativeBridge.setKeyCallback(keyCallback)
-        val ndev = NativeBridge.nativeStartInput("")
-        inputStarted = ndev > 0
-        android.util.Log.i("Kma", "输入监听启动, 设备数=$ndev")
+
+        // 后台线程: root 提权 → chmod /dev/input → 启动输入监听
+        Thread {
+            rootGranted = RootShell.hasRoot()
+            if (rootGranted) {
+                RootShell.grantDevPermissions()
+            }
+            val ndev = NativeBridge.nativeStartInput("")
+            inputStarted = ndev > 0
+            android.util.Log.i("Kma", "Root=$rootGranted 输入监听启动, 设备数=$ndev")
+            mainHandler.post { refreshStatus() }
+        }.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -90,7 +109,7 @@ class MappingService : Service() {
         // 停止映射 + 输入监听
         if (mappingStarted) NativeBridge.nativeStopMapping()
         if (inputStarted) NativeBridge.nativeStopInput()
-        // 统一移除所有悬浮 view（含面板、悬浮球、虚拟按键）
+        // 统一移除所有悬浮 view（含面板、悬浮球、虚拟按键、对话框）
         synchronized(allViews) {
             allViews.toList().forEach { runCatching { wm.removeView(it) } }
             allViews.clear()
@@ -115,18 +134,20 @@ class MappingService : Service() {
             setTextColor(0xFFFFFFFF.toInt())
         }
         statusText = TextView(this).apply {
-            text = statusLine()
+            text = "初始化中..."
             textSize = 12f
             setTextColor(0xFFCCCCCC.toInt())
             setPadding(0, 8, 0, 8)
         }
         val btnCreate = Button(this).apply { text = "创建新按键" }
         val btnDetect = Button(this).apply { text = "检测外设" }
+        val btnDiag = Button(this).apply { text = "驱动诊断" }
         val btnStart = Button(this).apply { text = "开始映射" }
         val btnHide = Button(this).apply { text = "隐藏面板" }
 
         btnCreate.setOnClickListener { createNewButton() }
         btnDetect.setOnClickListener { showDeviceList() }
+        btnDiag.setOnClickListener { showDriverDiagnostic() }
         btnStart.setOnClickListener {
             if (mappingStarted) { stopMapping(); btnStart.text = "开始映射" }
             else { startMapping(); btnStart.text = "停止映射" }
@@ -137,12 +158,14 @@ class MappingService : Service() {
         panel.addView(statusText)
         panel.addView(btnCreate)
         panel.addView(btnDetect)
+        panel.addView(btnDiag)
         panel.addView(btnStart)
         panel.addView(btnHide)
         panel.setBackgroundColor(0xDD222222.toInt())
 
         addView(panel, params)
         mainPanel = panel
+        refreshStatus()
     }
 
     private fun hideMainPanel() {
@@ -193,7 +216,12 @@ class MappingService : Service() {
     // ── 虚拟按键管理 ────────────────────────────────────
     private fun createNewButton() {
         if (!inputStarted) {
-            toast("输入监听未启动（需 root 读取 /dev/input）")
+            // 给出更具体的原因
+            val reason = when {
+                !rootGranted -> "未获得 root 权限（需 root 才能读取 /dev/input/event*）"
+                else -> "输入监听未启动（可能 /dev/input/event* 不存在或无键鼠设备）"
+            }
+            showOverlayMessage("无法创建按键", reason + "\n\n请点「检测外设」或「驱动诊断」查看详情")
             return
         }
         val btn = KeyButton(id = nextId++, x = screenWidth / 2, y = screenHeight / 2)
@@ -222,28 +250,37 @@ class MappingService : Service() {
         toast("新按键已创建，按下物理键绑定")
     }
 
-    /** 长按弹出类型选择菜单 */
+    /** 长按弹出类型选择菜单（overlay 实现，避免 AlertDialog BadTokenException） */
     private fun showTypePicker(button: KeyButton) {
-        val names = NativeBridge.ActionType.NAMES.values.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("选择按键类型: ${KeyButton.keyName(button.keyCode)}")
-            .setItems(names) { _, which ->
-                val actionCode = NativeBridge.ActionType.NAMES.keys.elementAt(which)
-                button.action = actionCode
-                when (actionCode) {
-                    NativeBridge.ActionType.REPEAT -> {
-                        askNumber("连点间隔(ms)", button.extra.ifZero(50)) { v -> button.extra = v; refreshAndSync(button) }
-                        return@setItems
-                    }
-                    NativeBridge.ActionType.JOYSTICK -> {
-                        askNumber("摇杆半径", button.extra.ifZero(120)) { v -> button.extra = v; refreshAndSync(button) }
-                        return@setItems
+        val items = NativeBridge.ActionType.NAMES.entries.toList()
+        // 末尾加"删除按键"选项
+        val labels = items.map { it.value }.toTypedArray() + arrayOf("删除按键")
+        showOverlayMenu(
+            "选择类型: ${KeyButton.keyName(button.keyCode)}",
+            labels,
+            onClose = { /* nothing */ }
+        ) { which ->
+            if (which == items.size) {
+                // 删除
+                removeButton(button)
+                return@showOverlayMenu
+            }
+            val actionCode = items[which].key
+            button.action = actionCode
+            when (actionCode) {
+                NativeBridge.ActionType.REPEAT -> {
+                    showOverlayInput("连点间隔(ms)", button.extra.ifZero(50).toString()) { v ->
+                        button.extra = v; refreshAndSync(button)
                     }
                 }
-                refreshAndSync(button)
+                NativeBridge.ActionType.JOYSTICK -> {
+                    showOverlayInput("摇杆半径", button.extra.ifZero(120).toString()) { v ->
+                        button.extra = v; refreshAndSync(button)
+                    }
+                }
+                else -> refreshAndSync(button)
             }
-            .setNeutralButton("删除") { _, _ -> removeButton(button) }
-            .show()
+        }
     }
 
     private fun refreshAndSync(button: KeyButton) {
@@ -268,24 +305,84 @@ class MappingService : Service() {
 
     // ── 硬件检测 ────────────────────────────────────────
     private fun showDeviceList() {
-        val text = NativeBridge.nativeGetDevices()
-        val devs = NativeBridge.parseDevices(text)
-        val sb = StringBuilder()
-        if (devs.isEmpty()) {
-            sb.append("未检测到键鼠外设\n（需 root 读取 /dev/input/event*）")
-        } else {
-            sb.append("检测到 ${devs.size} 个外设:\n\n")
-            devs.forEach {
-                sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n\n")
+        Thread {
+            // 先确保有权限（用户可能刚授权 root）
+            if (rootGranted) RootShell.grantDevPermissions()
+            val nativeText = NativeBridge.nativeGetDevices()
+            val devs = NativeBridge.parseDevices(nativeText)
+            val sb = StringBuilder()
+            sb.append("Root: ${if (rootGranted) "✓ 已授权" else "✗ 未授权"}\n")
+            sb.append("输入监听: ${if (inputStarted) "✓ 运行中" else "✗ 未启动"}\n\n")
+            if (devs.isEmpty()) {
+                sb.append("native 扫描未发现键鼠外设\n\n")
+                // 用 root 命令补充诊断
+                if (rootGranted) {
+                    sb.append("=== /dev/input/event* (root) ===\n")
+                    sb.append(RootShell.listInputNodes())
+                    sb.append("\n=== lsmod (含 twt?) ===\n")
+                    sb.append(RootShell.listModules().lines().filter {
+                        it.contains("twt", ignoreCase = true) ||
+                        it.contains("touch", ignoreCase = true) ||
+                        it.contains("input", ignoreCase = true)
+                    }.joinToString("\n").ifEmpty { "(未找到 twt/touch/input 相关模块)" })
+                }
+            } else {
+                sb.append("检测到 ${devs.size} 个外设:\n\n")
+                devs.forEach {
+                    sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n\n")
+                }
             }
-        }
-        // 同时刷新面板状态
-        statusText.text = statusLine(devs.size)
-        AlertDialog.Builder(this)
-            .setTitle("外设检测")
-            .setMessage(sb.toString())
-            .setPositiveButton("确定", null)
-            .show()
+            mainHandler.post {
+                refreshStatus(devs.size)
+                showOverlayMessage("外设检测", sb.toString())
+            }
+        }.start()
+    }
+
+    // ── 驱动诊断 ────────────────────────────────────────
+    private fun showDriverDiagnostic() {
+        Thread {
+            val sb = StringBuilder()
+            sb.append("=== 环境检查 ===\n")
+            sb.append("Root: ${if (rootGranted) "✓" else "✗"}\n")
+            sb.append("屏幕: ${screenWidth}x${screenHeight}\n")
+            sb.append("架构: ${Build.SUPPORTED_ABIS.joinToString(",")}\n\n")
+
+            sb.append("=== 内核模块 (lsmod) ===\n")
+            val mods = RootShell.listModules()
+            val touchMods = mods.lines().filter {
+                it.contains("twt", ignoreCase = true) ||
+                it.contains("touch", ignoreCase = true) ||
+                it.contains("aim", ignoreCase = true) ||
+                it.contains("rt_", ignoreCase = true) ||
+                it.contains("qx_", ignoreCase = true) ||
+                it.contains("zero", ignoreCase = true)
+            }
+            sb.append(touchMods.joinToString("\n").ifEmpty { "(未找到 twt/touch/aim/rt/qx/zero 相关模块)" })
+            sb.append("\n\n")
+
+            sb.append("=== /dev 驱动节点 ===\n")
+            val nodes = RootShell.exec("ls -la /dev/twt* /dev/aim_touch /dev/rt_touch /dev/qx_touch /dev/zero_touch /dev/ovo_touch /dev/hakutaku 2>/dev/null || echo '(无已知驱动节点)'")
+            sb.append(nodes)
+            sb.append("\n\n")
+
+            sb.append("=== native 驱动探测日志 ===\n")
+            sb.append("(执行 nativeInitDriver 探测...)\n")
+            // 实际执行一次探测并捕获诊断
+            val drv = NativeBridge.nativeInitDriver(screenWidth, screenHeight, NativeBridge.DriverType.AUTO)
+            sb.append("探测结果: ${if (drv.isEmpty()) "未对接 ✗" else "✓ $drv"}\n")
+            sb.append(NativeBridge.nativeDiagnoseDriver())
+            sb.append("\n")
+
+            if (drv.isEmpty()) {
+                sb.append("=== dmesg 末尾 (root) ===\n")
+                sb.append(RootShell.dmesgTail(20))
+            }
+
+            mainHandler.post {
+                showOverlayMessage("驱动诊断", sb.toString())
+            }
+        }.start()
     }
 
     // ── 映射开始/停止 ───────────────────────────────────
@@ -293,8 +390,19 @@ class MappingService : Service() {
         // 1. 初始化驱动并反馈状态
         driverName = NativeBridge.nativeInitDriver(screenWidth, screenHeight, NativeBridge.DriverType.AUTO)
         if (driverName.isEmpty()) {
-            statusText.text = "驱动: ✗ 未对接\n(需 root + 内核驱动 twt/rt/qx/zero)"
-            toast("驱动初始化失败：未检测到内核驱动")
+            val diag = NativeBridge.nativeDiagnoseDriver()
+            statusText.text = "驱动: ✗ 未对接\n(点「驱动诊断」查看详情)"
+            toast("驱动初始化失败")
+            // 自动弹出诊断
+            showOverlayMessage(
+                "驱动未对接",
+                "驱动探测失败，诊断日志:\n\n$diag\n\n" +
+                "可能原因:\n" +
+                "1. twt 模块未加载 → root 执行 insmod twt.ko\n" +
+                "2. /dev/*_touch 节点权限不足 → 已自动 chmod，若仍失败请检查 SELinux\n" +
+                "3. TwT syscall 未被 hook → 确认 twt 模块版本与 magic 一致\n" +
+                "4. 非 aarch64 架构 → TwT 仅支持 arm64"
+            )
             return
         }
         // 2. 同步所有已绑定按键
@@ -314,16 +422,139 @@ class MappingService : Service() {
         if (!mappingStarted) return
         NativeBridge.nativeStopMapping()
         mappingStarted = false
-        statusText.text = statusLine()
+        refreshStatus()
         toast("映射已停止（绑定仍可用）")
     }
 
+    // ── overlay 对话框（替代 AlertDialog，避免 BadTokenException）────
+    /** 显示消息型 overlay 对话框 */
+    private fun showOverlayMessage(title: String, message: String) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 24, 32, 24)
+            setBackgroundColor(0xEE333333.toInt())
+        }
+        val titleView = TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(0xFFFFFFFF.toInt()); setPadding(0, 0, 0, 16)
+        }
+        val msgView = TextView(this).apply {
+            text = message; textSize = 12f; setTextColor(0xFFDDDDDD.toInt())
+            setLineSpacing(2f, 1f)
+        }
+        val scroll = ScrollView(this).apply { addView(msgView) }
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 16, 0, 0)
+        }
+        val btnClose = Button(this).apply { text = "关闭" }
+        btnRow.addView(btnClose, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(titleView)
+        container.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        container.addView(btnRow)
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            windowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        btnClose.setOnClickListener { removeView(container) }
+        addView(container, lp)
+    }
+
+    /** 显示菜单型 overlay 对话框 */
+    private fun showOverlayMenu(title: String, items: Array<String>,
+                                 onClose: () -> Unit, onSelected: (Int) -> Unit) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 24, 32, 24)
+            setBackgroundColor(0xEE333333.toInt())
+        }
+        val titleView = TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(0xFFFFFFFF.toInt()); setPadding(0, 0, 0, 16)
+        }
+        container.addView(titleView)
+        items.forEachIndexed { idx, label ->
+            val btn = Button(this).apply {
+                text = label
+                setOnClickListener {
+                    removeView(container)
+                    onSelected(idx)
+                }
+            }
+            container.addView(btn)
+        }
+        val btnCancel = Button(this).apply {
+            text = "取消"
+            setOnClickListener { removeView(container); onClose() }
+        }
+        container.addView(btnCancel)
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            windowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+        addView(container, lp)
+    }
+
+    /** 显示数字输入型 overlay 对话框 */
+    private fun showOverlayInput(title: String, default: String, onConfirm: (Int) -> Unit) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 24, 32, 24)
+            setBackgroundColor(0xEE333333.toInt())
+        }
+        val titleView = TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(0xFFFFFFFF.toInt()); setPadding(0, 0, 0, 16)
+        }
+        val edit = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(default)
+        }
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnOk = Button(this).apply {
+            text = "确定"
+            setOnClickListener {
+                val v = edit.text.toString().toIntOrNull() ?: 0
+                removeView(container); onConfirm(v)
+            }
+        }
+        val btnCancel = Button(this).apply {
+            text = "取消"
+            setOnClickListener { removeView(container) }
+        }
+        btnRow.addView(btnOk, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(btnCancel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(titleView)
+        container.addView(edit)
+        container.addView(btnRow)
+
+        // 输入框需要焦点 → 不能 FLAG_NOT_FOCUSABLE
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            windowType(),
+            0,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+        addView(container, lp)
+    }
+
     // ── 工具 ────────────────────────────────────────────
-    private fun statusLine(devCount: Int = -1): String {
-        val dc = if (devCount >= 0) devCount else NativeBridge.parseDevices(NativeBridge.nativeGetDevices()).size
+    private fun refreshStatus(devCount: Int = -1) {
+        val dc = if (devCount >= 0) devCount
+                 else NativeBridge.parseDevices(NativeBridge.nativeGetDevices()).size
+        val root = if (rootGranted) "Root:✓" else "Root:✗"
         val input = if (inputStarted) "输入:✓($dc 设备)" else "输入:✗"
-        val drv = if (mappingStarted) "驱动:✓ $driverName" else if (driverName.isNotEmpty()) "驱动:$driverName(未启动)" else "驱动:未对接"
-        return "$input\n$drv"
+        val drv = if (mappingStarted) "驱动:✓ $driverName (运行中)"
+                  else if (driverName.isNotEmpty()) "驱动:$driverName(未启动)"
+                  else "驱动:未对接"
+        statusText?.text = "$root\n$input\n$drv"
     }
 
     private fun addView(v: View, lp: WindowManager.LayoutParams) {
@@ -357,20 +588,8 @@ class MappingService : Service() {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-    private fun askNumber(title: String, default: Int, cb: (Int) -> Unit) {
-        val input = android.widget.EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            setText(default.toString())
-        }
-        AlertDialog.Builder(this).setTitle(title).setView(input)
-            .setPositiveButton("确定") { _, _ -> cb(input.text.toString().toIntOrNull() ?: default) }
-            .setNegativeButton("取消", null).show()
-    }
-
     private fun toast(msg: String) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-        }
+        mainHandler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
     }
 
     private fun startForegroundCompat() {

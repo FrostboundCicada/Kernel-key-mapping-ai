@@ -167,11 +167,15 @@ Java_com_kma_mapping_NativeBridge_nativeGetDevices(JNIEnv* env, jobject /*thiz*/
 }
 
 // ── 驱动初始化（"开始映射"时调用）────────────────────────
-// 返回驱动名(成功) / 空串(失败)
+// 返回驱动名(成功) / 空串(失败)。失败时诊断日志可通过 nativeDiagnoseDriver 读取。
 JNIEXPORT jstring JNICALL
 Java_com_kma_mapping_NativeBridge_nativeInitDriver(JNIEnv* env, jobject /*thiz*/,
                                                     jint screenW, jint screenH, jint driverType) {
     std::lock_guard<std::mutex> lk(g_mtx);
+    // 释放旧驱动
+    if (g_mapper.driver()) {
+        // mapper 内部 owns_driver_ 会处理释放
+    }
     MapperConfig cfg;
     cfg.screen_w = screenW;
     cfg.screen_h = screenH;
@@ -186,6 +190,12 @@ Java_com_kma_mapping_NativeBridge_nativeInitDriver(JNIEnv* env, jobject /*thiz*/
     ITouchDriver* drv = g_mapper.driver();
     LOGI("驱动已对接: %s 陀螺仪:%d", drv->name(), drv->hasGyro());
     return env->NewStringUTF(drv->name());
+}
+
+// 返回驱动探测诊断日志（含每步成功/失败原因 + errno）
+JNIEXPORT jstring JNICALL
+Java_com_kma_mapping_NativeBridge_nativeDiagnoseDriver(JNIEnv* env, jobject /*thiz*/) {
+    return env->NewStringUTF(driverDiagnosticLog().c_str());
 }
 
 // 获取驱动是否支持陀螺仪（需先 initDriver）

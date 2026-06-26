@@ -51,6 +51,8 @@ object NativeBridge {
 
     /** 驱动初始化（开始映射时）。返回驱动名/空串 */
     @JvmStatic external fun nativeInitDriver(screenW: Int, screenH: Int, driverType: Int): String
+    /** 驱动探测诊断日志（nativeInitDriver 失败后读取，含每步原因 + errno） */
+    @JvmStatic external fun nativeDiagnoseDriver(): String
     @JvmStatic external fun hasGyro(): Boolean
 
     /** 映射启停 */
