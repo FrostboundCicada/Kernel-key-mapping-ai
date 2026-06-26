@@ -6,8 +6,8 @@ project(kma LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 仓库根目录：当前文件在 app/src/main/cpp/，向上 3 级 cpp->main->app->根
-get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+# 仓库根目录：当前文件在 app/src/main/cpp/，路径 cpp->main->app->src->根，向上 4 级
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(KMA_SRC_DIR "${REPO_ROOT}/src")
 
 # 共享库 kma —— 引用仓库根 src/ 下的 C++ 核心 + JNI 桥接
