@@ -47,12 +47,26 @@ bool InputReader::probeDevice(int fd, InputDevInfo& info) {
                          test_bit_arr(keybit, BTN_MIDDLE);
     info.is_mouse = has_ev_rel && (has_rel_xy || has_mouse_btn);
 
-    // 键盘：EV_KEY 含典型字母键
+    // 键盘识别（放宽）：检查字母 A~Z 全部 + 常见修饰键 + 数字键 + 功能键
+    // 某些精简键盘可能只报告部分键，放宽到只要有"多个 KEY 事件"就认为是键盘
     bool has_letter = false;
-    for (int c = KEY_Q; c <= KEY_M; ++c) {
+    for (int c = KEY_A; c <= KEY_Z; ++c) {  // KEY_A=30 ~ KEY_Z=44
         if (test_bit_arr(keybit, c)) { has_letter = true; break; }
     }
-    info.is_keyboard = has_ev_key && (has_letter || test_bit_arr(keybit, KEY_SPACE));
+    bool has_common_key = test_bit_arr(keybit, KEY_SPACE) ||
+                          test_bit_arr(keybit, KEY_ENTER) ||
+                          test_bit_arr(keybit, KEY_LEFTSHIFT) ||
+                          test_bit_arr(keybit, KEY_RIGHTSHIFT) ||
+                          test_bit_arr(keybit, KEY_LEFTCTRL) ||
+                          test_bit_arr(keybit, KEY_TAB) ||
+                          test_bit_arr(keybit, KEY_BACKSPACE) ||
+                          test_bit_arr(keybit, KEY_ESC);
+    // 统计 KEY 事件总数，超过 10 个基本可以确定是键盘
+    int key_count = 0;
+    for (int c = 0; c < KEY_MAX && key_count < 11; ++c) {
+        if (test_bit_arr(keybit, c)) ++key_count;
+    }
+    info.is_keyboard = has_ev_key && (has_letter || has_common_key || key_count >= 10);
 
     return info.is_keyboard || info.is_mouse;
 }
@@ -63,12 +77,16 @@ int InputReader::scanAndOpen(const std::string& filter_name) {
 
     int opened = 0;
     struct dirent* ent;
+    // 第一遍：找键鼠设备
+    std::vector<std::string> all_event_paths;
     while ((ent = readdir(dir)) != nullptr) {
         if (strncmp(ent->d_name, "event", 5) != 0) continue;
+        std::string path = std::string("/dev/input/") + ent->d_name;
+        all_event_paths.push_back(path);
 
         InputDevInfo info;
-        info.path = std::string("/dev/input/") + ent->d_name;
-        int fd = open(info.path.c_str(), O_RDONLY);
+        info.path = path;
+        int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
 
         if (!probeDevice(fd, info)) { close(fd); continue; }
@@ -90,7 +108,35 @@ int InputReader::scanAndOpen(const std::string& filter_name) {
     }
     closedir(dir);
 
-    if (opened == 0) last_err_ = "未找到键盘或鼠标设备";
+    // Fallback：如果没检测到键鼠，打开所有 event 设备
+    // （某些键鼠可能未被 probeDevice 识别，或用户想监听触摸屏/其他设备）
+    if (opened == 0 && filter_name.empty()) {
+        for (const auto& path : all_event_paths) {
+            int fd = open(path.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            InputDevInfo info;
+            info.path = path;
+            info.is_keyboard = false;
+            info.is_mouse = false;
+            char name[256] = {0};
+            ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
+            info.name = name;
+            info.fd = fd;
+            devs_.push_back(info);
+            ++opened;
+            struct epoll_event ev{};
+            ev.events = EPOLLIN;
+            ev.data.fd = fd;
+            epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+        }
+        if (opened > 0) {
+            last_err_ = "未识别到键鼠，已打开所有 event 设备作为 fallback";
+        } else {
+            last_err_ = "未找到任何输入设备";
+        }
+    } else if (opened == 0) {
+        last_err_ = "未找到匹配 '" + filter_name + "' 的设备";
+    }
     return opened;
 }
 

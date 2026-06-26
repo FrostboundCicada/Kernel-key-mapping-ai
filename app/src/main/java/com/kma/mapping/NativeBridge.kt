@@ -45,6 +45,8 @@ object NativeBridge {
     @JvmStatic external fun nativeStartInput(inputFilter: String): Int
     /** 停止输入监听 */
     @JvmStatic external fun nativeStopInput()
+    /** 输入监听状态详情（诊断用）：运行中/设备数/最近错误/已打开设备列表 */
+    @JvmStatic external fun nativeInputStatus(): String
 
     /** 硬件检测：返回设备列表文本，每行 path|name|isKb|isMouse */
     @JvmStatic external fun nativeGetDevices(): String
@@ -69,12 +71,14 @@ object NativeBridge {
     /** 已连接的输入设备信息 */
     data class DeviceInfo(
         val path: String, val name: String,
-        val isKeyboard: Boolean, val isMouse: Boolean
+        val isKeyboard: Boolean, val isMouse: Boolean,
+        val keyCount: Int = 0, val hasRel: Boolean = false
     ) {
         val type: String get() = when {
             isKeyboard && isMouse -> "键鼠一体"
             isKeyboard -> "键盘"
             isMouse -> "鼠标"
+            keyCount > 0 -> "按键设备($keyCount 键)"
             else -> "其它"
         }
     }
@@ -86,7 +90,14 @@ object NativeBridge {
             if (line.isBlank()) return@forEach
             val p = line.split("|")
             if (p.size >= 4) {
-                list.add(DeviceInfo(p[0], p[1], p[2] == "1", p[3] == "1"))
+                list.add(DeviceInfo(
+                    path = p[0],
+                    name = p[1],
+                    isKeyboard = p[2] == "1",
+                    isMouse = p[3] == "1",
+                    keyCount = p.getOrNull(4)?.toIntOrNull() ?: 0,
+                    hasRel = p.getOrNull(5) == "1"
+                ))
             }
         }
         return list

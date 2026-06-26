@@ -123,9 +123,24 @@ Java_com_kma_mapping_NativeBridge_nativeStopInput(JNIEnv* /*env*/, jobject /*thi
     if (g_input_thread.joinable()) g_input_thread.join();
 }
 
+// 获取输入监听最近一次错误/状态描述（诊断用）
+JNIEXPORT jstring JNICALL
+Java_com_kma_mapping_NativeBridge_nativeInputStatus(JNIEnv* env, jobject /*thiz*/) {
+    std::string s;
+    s += "运行中: " + std::string(g_input_running.load() ? "是" : "否") + "\n";
+    s += "已打开设备数: " + std::to_string(g_reader.devices().size()) + "\n";
+    s += "最近错误: " + g_reader.lastError() + "\n";
+    s += "已打开设备列表:\n";
+    for (const auto& d : g_reader.devices()) {
+        s += "  " + d.path + " [" + d.name + "] kb=" +
+             (d.is_keyboard ? "1" : "0") + " mouse=" + (d.is_mouse ? "1" : "0") + "\n";
+    }
+    return env->NewStringUTF(s.c_str());
+}
+
 // ── 硬件检测（独立扫描，不占用设备）──────────────────────
-// 返回设备列表文本，每行: path|name|is_keyboard|is_mouse
-// 例: /dev/input/event3|Logitech USB Keyboard|1|0
+// 返回设备列表文本，每行: path|name|is_keyboard|is_mouse|key_count|has_rel
+// 列出所有 /dev/input/event* 设备（不只是键鼠），方便用户排查
 JNIEXPORT jstring JNICALL
 Java_com_kma_mapping_NativeBridge_nativeGetDevices(JNIEnv* env, jobject /*thiz*/) {
     std::string result;
@@ -137,7 +152,11 @@ Java_com_kma_mapping_NativeBridge_nativeGetDevices(JNIEnv* env, jobject /*thiz*/
         if (strncmp(ent->d_name, "event", 5) != 0) continue;
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
         int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            // 无法打开的也记录（权限问题）
+            result += std::string(path) + "|(无权限)|0|0|0|0\n";
+            continue;
+        }
 
         memset(name, 0, sizeof(name));
         ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
@@ -154,13 +173,21 @@ Java_com_kma_mapping_NativeBridge_nativeGetDevices(JNIEnv* env, jobject /*thiz*/
         auto test = [](const unsigned char* b, int c) { return (b[c/8] >> (c%8)) & 1; };
         bool has_ev_key = test(evbit, EV_KEY);
         bool has_ev_rel = test(evbit, EV_REL);
-        bool is_kb = has_ev_key && (test(keybit, KEY_Q) || test(keybit, KEY_SPACE));
+        bool is_kb = has_ev_key && (test(keybit, KEY_Q) || test(keybit, KEY_SPACE) ||
+                     test(keybit, KEY_A) || test(keybit, KEY_ENTER));
         bool is_mouse = has_ev_rel && (test(relbit, REL_X) || test(keybit, BTN_LEFT));
-        // 只上报键鼠类设备
-        if (!is_kb && !is_mouse) continue;
+        // 统计按键数（判断是否键盘的有力指标）
+        int key_count = 0;
+        for (int c = 0; c < KEY_MAX; ++c) {
+            if (test(keybit, c)) ++key_count;
+            if (key_count >= 999) break;
+        }
 
-        result += std::string(path) + "|" + std::string(name) + "|"
-                + (is_kb ? "1" : "0") + "|" + (is_mouse ? "1" : "0") + "\n";
+        char line[512];
+        snprintf(line, sizeof(line), "%s|%s|%d|%d|%d|%d\n",
+                 path, name, is_kb ? 1 : 0, is_mouse ? 1 : 0,
+                 key_count, has_ev_rel ? 1 : 0);
+        result += line;
     }
     closedir(dir);
     return env->NewStringUTF(result.c_str());

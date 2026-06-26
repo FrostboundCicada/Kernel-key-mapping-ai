@@ -314,22 +314,27 @@ class MappingService : Service() {
             sb.append("Root: ${if (rootGranted) "✓ 已授权" else "✗ 未授权"}\n")
             sb.append("输入监听: ${if (inputStarted) "✓ 运行中" else "✗ 未启动"}\n\n")
 
-            // 1) 键鼠外设（/dev/input/event*）
-            sb.append("=== 键鼠外设 (/dev/input/event*) ===\n")
+            // 1) 列出所有 /dev/input/event* 设备（含未识别为键鼠的）
+            sb.append("=== 所有输入设备 (/dev/input/event*) ===\n")
             if (devs.isEmpty()) {
-                sb.append("(未检测到键盘/鼠标)\n")
-                if (rootGranted) {
-                    sb.append("原始节点列表:\n")
-                    sb.append(RootShell.listInputNodes())
-                }
+                sb.append("(无设备或无权限读取)\n")
             } else {
-                devs.forEach {
-                    sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n")
+                devs.forEach { d ->
+                    val mark = when {
+                        d.isKeyboard && d.isMouse -> "★键鼠"
+                        d.isKeyboard -> "★键盘"
+                        d.isMouse -> "★鼠标"
+                        d.keyCount > 5 -> "?疑似键盘(${d.keyCount}键)"
+                        else -> ""
+                    }
+                    sb.append("• ${d.path}")
+                    if (mark.isNotEmpty()) sb.append("  [$mark]")
+                    sb.append("\n  名称: ${d.name}\n")
+                    sb.append("  键数:${d.keyCount} 相对位移:${if (d.hasRel) "有" else "无"}\n\n")
                 }
             }
-            sb.append("\n")
 
-            // 2) 触摸驱动节点（/dev/twt /dev/*_touch 等）— 这是用户刷入的内核驱动节点
+            // 2) 触摸驱动节点
             sb.append("=== 触摸驱动节点 (/dev/*_touch /dev/twt 等) ===\n")
             val touchNodes = RootShell.exec(
                 "ls -la /dev/ 2>/dev/null | grep -iE 'touch|twt|rt_|rtdev|qx|zero|aim|hakutaku|ovo|input_handle|inject' | grep -v 'input/' || echo '(无触摸驱动节点)'"
@@ -347,11 +352,17 @@ class MappingService : Service() {
                 it.contains("qx", true) || it.contains("zero", true) ||
                 it.contains("hakutaku", true) || it.contains("ovo", true)
             }
-            sb.append(touchMods.joinToString("\n").ifEmpty { "(未找到相关模块)" })
+            sb.append(touchMods.joinToString("\n").ifEmpty { "(未找到相关模块，可能已内置进内核)" })
 
+            // 统计键鼠
+            val kbCount = devs.count { it.isKeyboard }
+            val mouseCount = devs.count { it.isMouse }
             mainHandler.post {
                 refreshStatus(devs.size)
-                showOverlayMessageWithCopy("外设检测", sb.toString())
+                showOverlayMessageWithCopy(
+                    "外设检测",
+                    sb.toString() + "\n\n汇总: ${devs.size} 个设备 (键盘 $kbCount / 鼠标 $mouseCount)"
+                )
             }
         }.start()
     }
@@ -370,6 +381,10 @@ class MappingService : Service() {
             sb.append("=== SELinux 状态 ===\n")
             sb.append(RootShell.exec("getenforce 2>/dev/null || echo '无法读取'"))
             sb.append("\n\n")
+
+            sb.append("=== 输入监听状态 (native) ===\n")
+            sb.append(NativeBridge.nativeInputStatus())
+            sb.append("\n")
 
             sb.append("=== 内核模块 (lsmod 完整) ===\n")
             val mods = RootShell.listModules()
