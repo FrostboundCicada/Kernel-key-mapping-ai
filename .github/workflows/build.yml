@@ -137,7 +137,10 @@ jobs:
       - name: Package APK artifact
         run: |
           mkdir -p apk-out
-          cp app/build/outputs/apk/debug/*.apk apk-out/kma-android-debug.apk
+          APK=$(find . -name "*.apk" -path "*debug*" | head -1)
+          echo "找到 APK: $APK"
+          if [ -z "$APK" ]; then echo "未找到 APK"; exit 1; fi
+          cp "$APK" apk-out/kma-android-debug.apk
           ls -la apk-out/
 
       - name: Upload APK artifact
