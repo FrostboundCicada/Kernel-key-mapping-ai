@@ -1,0 +1,172 @@
+# build.yml — 云端构建并上传发行版
+#
+# 触发:
+#   1. push tag "v*" (如 v1.0.0) → 构建并创建 GitHub Release
+#   2. workflow_dispatch (Actions 页面手动触发) → 仅构建产物，可选发布
+#
+# 产物:
+#   - kma_mapper-android-arm64   Android aarch64 (NDK 交叉编译)
+#   - kma_mapper-linux-x64       Linux x86_64 (直接编译)
+#   - kma_config-android-arm64   配置工具 Android 版
+#   - kma_config-linux-x64       配置工具 Linux 版
+#   - configs/default.conf       默认配置
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '发布为 Release (仅打 tag 触发时建议开启)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write   # 创建 release 需要
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android-arm64
+            os: android
+            arch: arm64-v8a
+            cc: aarch64-linux-android24-clang
+            cxx: aarch64-linux-android24-clang++
+          - target: linux-x64
+            os: linux
+            arch: x86_64
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        if: matrix.os == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup_ndk
+        with:
+          ndk-version: r26b
+
+      - name: Configure (Android)
+        if: matrix.os == 'android'
+        env:
+          NDK_TOOLCHAIN: ${{ steps.setup_ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake
+        run: |
+          mkdir -p build-${{ matrix.target }}
+          cd build-${{ matrix.target }}
+          cmake -G "Ninja" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
+            -DANDROID_ABI=${{ matrix.arch }} \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
+            ..
+
+      - name: Configure (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p build-${{ matrix.target }}
+          cd build-${{ matrix.target }}
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+                -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+                ..
+
+      - name: Build
+        run: |
+          cmake --build build-${{ matrix.target }} -j --target kma_mapper kma_config
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifact-${{ matrix.target }}
+          cp build-${{ matrix.target }}/kma_mapper artifact-${{ matrix.target }}/
+          cp build-${{ matrix.target }}/kma_config artifact-${{ matrix.target }}/
+          cp -r configs artifact-${{ matrix.target }}/
+          cp README.md artifact-${{ matrix.target }}/
+          # 打包
+          cd artifact-${{ matrix.target }}
+          tar -czf ../kma-${{ matrix.target }}.tar.gz .
+          cd ..
+          ls -la kma-${{ matrix.target }}.tar.gz
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kma-${{ matrix.target }}
+          path: kma-${{ matrix.target }}.tar.gz
+          retention-days: 14
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    # tag 触发自动发布；手动触发时按 inputs.publish 决定
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          {
+            echo "notes<<EOF"
+            echo "## Kernel-key-mapping-ai ${TAG}"
+            echo ""
+            echo "内核驱动键鼠映射 (twt / rt / qx / zero ...)"
+            echo ""
+            echo "### 产物"
+            echo "- \`kma-android-arm64.tar.gz\` — Android aarch64 (NDK 交叉编译，需 Root + 内核驱动)"
+            echo "- \`kma-linux-x64.tar.gz\` — Linux x86_64 (测试用)"
+            echo ""
+            echo "### 用法"
+            echo '```bash'
+            echo "tar -xzf kma-android-arm64.tar.gz"
+            echo "# 编辑配置(交互式)"
+            echo "./kma_config -c configs/default.conf"
+            echo "# 运行(需 root + 已加载内核驱动)"
+            echo "./kma_mapper -c configs/default.conf"
+            echo "# 或命令行直接指定映射"
+            echo "./kma_mapper -m KEY_W:hold:540:1700 -m MOUSE_LEFT:hold:920:2050"
+            echo '```'
+            echo ""
+            echo "### 运行中"
+            echo "- \`SIGHUP\` 重新加载配置文件"
+            echo "- \`Ctrl+C\` 退出"
+            echo ""
+            echo "完整说明见 README.md"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Nightly Build' }}
+          body: ${{ steps.notes.outputs.notes }}
+          draft: false
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          files: release-assets/*.tar.gz

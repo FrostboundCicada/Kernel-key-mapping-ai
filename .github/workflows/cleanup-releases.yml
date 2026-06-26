@@ -1,0 +1,112 @@
+# cleanup-releases.yml — 清理旧发行版
+#
+# 触发:
+#   1. schedule: 每周日 03:00 UTC 自动清理
+#   2. workflow_dispatch: 手动触发，可指定保留数量与是否仅删 prerelease
+#
+# 行为:
+#   按 created 时间倒序保留最新的 N 个 release，删除其余。
+#   - keep_count: 保留数量 (默认 5)
+#   - prerelease_only: true 时仅清理预发布(nightly)，正式 release 全部保留
+#   - delete_tags: true 时连同关联 git tag 一起删除
+#   - dry_run: true 时仅打印将删除的 release，不实际删除
+#
+# 实现: 用 gh CLI 精细控制（不依赖第三方 action，逻辑透明可审计）。
+name: Cleanup Old Releases
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # 每周日 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      keep_count:
+        description: '保留最新的 release 数量'
+        required: true
+        default: '5'
+      prerelease_only:
+        description: '仅清理预发布(prerelease/nightly)'
+        required: true
+        default: 'true'
+      delete_tags:
+        description: '同时删除关联的 git tag'
+        required: true
+        default: 'true'
+      dry_run:
+        description: '试运行(只打印不删除)'
+        required: true
+        default: 'true'
+
+permissions:
+  contents: write   # 删除 release / tag 需要
+
+jobs:
+  cleanup:
+    name: Cleanup releases
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve parameters
+        id: params
+        run: |
+          # 手动触发用 inputs；定时触发用默认值
+          KEEP="${{ github.event.inputs.keep_count || '5' }}"
+          PREONLY="${{ github.event.inputs.prerelease_only || 'true' }}"
+          DELTAG="${{ github.event.inputs.delete_tags || 'true' }}"
+          DRY="${{ github.event.inputs.dry_run || 'true' }}"
+          echo "keep=$KEEP"        >> "$GITHUB_OUTPUT"
+          echo "preonly=$PREONLY"  >> "$GITHUB_OUTPUT"
+          echo "deltag=$DELTAG"    >> "$GITHUB_OUTPUT"
+          echo "dry=$DRY"          >> "$GITHUB_OUTPUT"
+          echo "::notice::参数 保留=$KEEP 仅预发布=$PREONLY 删tag=$DELTAG 试运行=$DRY"
+
+      - name: List and delete old releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PREONLY: ${{ steps.params.outputs.preonly }}
+          DELTAG: ${{ steps.params.outputs.deltag }}
+          DRY: ${{ steps.params.outputs.dry }}
+          KEEP: ${{ steps.params.outputs.keep }}
+        run: |
+          set -e
+          echo "=== 清理前 release 列表 ==="
+          gh release list --repo "$REPO" --limit 100 || true
+
+          # 取所有 release，按 created_at 倒序，字段: id|tag|prerelease|created|name
+          mapfile -t REL_LIST < <(gh api "repos/$REPO/releases?per_page=100" \
+            --jq '. | sort_by(.created_at) | reverse | .[] | "\(.id)|\(.tag_name)|\(.prerelease)|\(.created_at)|\(.name)"') || true
+
+          total=${#REL_LIST[@]}
+          echo "共 $total 个 release，保留最新 $KEEP 个"
+
+          kept=0
+          for line in "${REL_LIST[@]}"; do
+            IFS='|' read -r id tag pre created name <<< "$line"
+            [ -z "$id" ] && continue
+
+            # 仅预发布模式：正式 release 永远保留
+            if [ "$PREONLY" = "true" ] && [ "$pre" = "false" ]; then
+              echo "[保留正式] $name ($tag) created=$created"
+              continue
+            fi
+            kept=$((kept+1))
+            if [ "$kept" -le "$KEEP" ]; then
+              echo "[保留#$kept] $name ($tag) created=$created"
+              continue
+            fi
+
+            # 需要删除
+            if [ "$DRY" = "true" ]; then
+              echo "[试运行-将删除] $name ($tag) id=$id created=$created pre=$pre"
+            else
+              echo "[删除] $name ($tag) id=$id"
+              if [ "$DELTAG" = "true" ]; then
+                gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag || true
+              else
+                gh release delete "$tag" --repo "$REPO" --yes || true
+              fi
+            fi
+          done
+
+          echo "=== 清理后 release 列表 ==="
+          gh release list --repo "$REPO" --limit 100 || true

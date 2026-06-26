@@ -67,6 +67,21 @@ public:
     // 用给定配置初始化（不用文件）
     void setConfig(const MapperConfig& cfg) { cfg_ = cfg; }
 
+    // ── 运行时增删按键映射 ──────────────────────────────
+    // 添加或覆盖一个按键映射。返回是否成功（按键码合法）。
+    bool addKeyMap(int code, KeyAction action, int x, int y);
+    bool addKeyMap(const std::string& key_name, const std::string& action_str,
+                   int x, int y);
+    // 删除指定按键的映射，返回是否删除成功
+    bool removeKeyMap(int code);
+    bool removeKeyMap(const std::string& key_name);
+    // 清空所有按键映射
+    void clearKeyMaps();
+    // 列出所有按键映射（用于交互工具/日志）
+    std::string dumpKeyMaps() const;
+    // 把当前配置（含按键映射）写回文件
+    bool saveConfig(const std::string& path) const;
+
     // 初始化驱动（按配置 driver 字段探测）。成功返回 true
     bool initDriver();
 

@@ -33,5 +33,13 @@ target_include_directories(kma_mapper PRIVATE src)
 find_package(Threads REQUIRED)
 target_link_libraries(kma_mapper PRIVATE Threads::Threads)
 
+# 交互式配置工具（纯配置编辑，不依赖驱动/输入设备，无 root 也可用）
+add_executable(kma_config
+    src/kma_config.cpp
+    src/mapper.cpp
+    src/driver_adapter.cpp
+)
+target_include_directories(kma_config PRIVATE src)
+
 # 安装
-install(TARGETS kma_mapper RUNTIME DESTINATION bin)
+install(TARGETS kma_mapper kma_config RUNTIME DESTINATION bin)

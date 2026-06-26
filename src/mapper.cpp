@@ -35,7 +35,14 @@ static const KeyNameEntry kKeyNames[] = {
     {"KEY_TAB", KEY_TAB}, {"KEY_LEFTSHIFT", KEY_LEFTSHIFT},
     {"KEY_RIGHTSHIFT", KEY_RIGHTSHIFT}, {"KEY_LEFTCTRL", KEY_LEFTCTRL},
     {"KEY_RIGHTCTRL", KEY_RIGHTCTRL}, {"KEY_LEFTALT", KEY_LEFTALT},
-    {"KEY_CAPSLOCK", KEY_CAPSLOCK},
+    {"KEY_RIGHTALT", KEY_RIGHTALT}, {"KEY_CAPSLOCK", KEY_CAPSLOCK},
+    {"KEY_BACKSPACE", KEY_BACKSPACE}, {"KEY_INSERT", KEY_INSERT},
+    {"KEY_DELETE", KEY_DELETE}, {"KEY_HOME", KEY_HOME}, {"KEY_END", KEY_END},
+    {"KEY_PAGEUP", KEY_PAGEUP}, {"KEY_PAGEDOWN", KEY_PAGEDOWN},
+    // F1-F12
+    {"KEY_F1", KEY_F1}, {"KEY_F2", KEY_F2}, {"KEY_F3", KEY_F3}, {"KEY_F4", KEY_F4},
+    {"KEY_F5", KEY_F5}, {"KEY_F6", KEY_F6}, {"KEY_F7", KEY_F7}, {"KEY_F8", KEY_F8},
+    {"KEY_F9", KEY_F9}, {"KEY_F10", KEY_F10}, {"KEY_F11", KEY_F11}, {"KEY_F12", KEY_F12},
     // 方向
     {"KEY_UP", KEY_UP}, {"KEY_DOWN", KEY_DOWN},
     {"KEY_LEFT", KEY_LEFT}, {"KEY_RIGHT", KEY_RIGHT},
@@ -136,6 +143,82 @@ bool Mapper::parseConfigText(const std::string& text) {
             if (code < 0) { last_err_ = "未知按键: " + kname; continue; }
             cfg_.keys.push_back({code, ka, x, y});
         }
+    }
+    return true;
+}
+
+// 字符串 → KeyAction，未知串默认 HOLD
+static KeyAction parseAction(const std::string& s) {
+    std::string u = toUpper(s);
+    if (u == "CLICK") return KeyAction::CLICK;
+    if (u == "TOGGLE") return KeyAction::TOGGLE;
+    return KeyAction::HOLD;
+}
+static const char* actionName(KeyAction a) {
+    switch (a) {
+    case KeyAction::CLICK:  return "click";
+    case KeyAction::HOLD:   return "hold";
+    case KeyAction::TOGGLE: return "toggle";
+    }
+    return "hold";
+}
+
+bool Mapper::addKeyMap(int code, KeyAction action, int x, int y) {
+    if (code < 0) { last_err_ = "无效按键码"; return false; }
+    // 覆盖已有同 code 映射
+    for (auto& k : cfg_.keys) {
+        if (k.code == code) { k.action = action; k.x = x; k.y = y; return true; }
+    }
+    cfg_.keys.push_back({code, action, x, y});
+    return true;
+}
+
+bool Mapper::addKeyMap(const std::string& key_name, const std::string& action_str,
+                       int x, int y) {
+    int code = keyNameToCode(toUpper(key_name));
+    if (code < 0) { last_err_ = "未知按键名: " + key_name; return false; }
+    return addKeyMap(code, parseAction(action_str), x, y);
+}
+
+bool Mapper::removeKeyMap(int code) {
+    for (auto it = cfg_.keys.begin(); it != cfg_.keys.end(); ++it) {
+        if (it->code == code) { cfg_.keys.erase(it); return true; }
+    }
+    return false;
+}
+
+bool Mapper::removeKeyMap(const std::string& key_name) {
+    int code = keyNameToCode(toUpper(key_name));
+    if (code < 0) return false;
+    return removeKeyMap(code);
+}
+
+void Mapper::clearKeyMaps() { cfg_.keys.clear(); }
+
+std::string Mapper::dumpKeyMaps() const {
+    std::ostringstream os;
+    os << "按键映射 (" << cfg_.keys.size() << " 条):\n";
+    for (const auto& k : cfg_.keys) {
+        os << "  " << keyCodeToName(k.code) << "  " << actionName(k.action)
+           << "  (" << k.x << "," << k.y << ")\n";
+    }
+    return os.str();
+}
+
+bool Mapper::saveConfig(const std::string& path) const {
+    std::ofstream f(path);
+    if (!f) { return false; }
+    f << "# Kernel-key-mapping-ai 配置 (由程序生成)\n";
+    f << "screen " << cfg_.screen_w << " " << cfg_.screen_h << "\n";
+    const char* drv = cfg_.driver == DriverType::TWT ? "twt"
+                    : cfg_.driver == DriverType::INPUT_HANDLE ? "input" : "auto";
+    f << "driver " << drv << "\n";
+    f << "mouse_mode " << (cfg_.mouse_mode == MouseMode::GYRO ? "gyro" : "drag") << "\n";
+    f << "sensitivity " << cfg_.sensitivity << "\n";
+    f << "gyro_sensitivity " << cfg_.gyro_sensitivity << "\n\n";
+    for (const auto& k : cfg_.keys) {
+        f << keyCodeToName(k.code) << " " << actionName(k.action)
+          << " " << k.x << " " << k.y << "\n";
     }
     return true;
 }
