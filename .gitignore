@@ -1,0 +1,7 @@
+build/
+*.o
+*.so
+*.ko
+kma_mapper
+.idea/
+.vscode/
