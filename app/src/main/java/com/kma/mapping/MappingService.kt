@@ -9,7 +9,6 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
-import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -24,27 +23,33 @@ import kotlin.math.abs
 /**
  * 悬浮窗映射服务。
  *
- * 职责:
- *   1. 显示主控悬浮窗（含"创建新按键"按钮 + 开始/停止映射 + 隐藏）
- *   2. 管理虚拟按键 [KeyButtonView] 的创建/拖拽/删除
- *   3. 绑定流程：单击虚拟按键 → "待选择" → 捕获物理键 → 绑定
- *   4. 长按虚拟按键 → 弹出类型选择菜单（移动/按键/单击/连点/长按/锁定切换/摇杆/轮盘/灵敏度）
- *   5. 把映射通过 [NativeBridge] 同步到 native 层并启动输入读取
+ * 生命周期与输入监听:
+ *   - onCreate: 立即 setKeyCallback + nativeStartInput
+ *     → 服务一启动，物理按键就能被捕获用于"待选择"绑定（无需先开始映射）
+ *   - "开始映射": nativeInitDriver(显示驱动状态) + nativeStartMapping
+ *   - "停止映射": nativeStopMapping（输入监听保留，绑定仍可用）
+ *   - onDestroy: nativeStopMapping + nativeStopInput + 移除所有悬浮 view
+ *
+ * 悬浮窗管理: 所有 view 加入 allViews，onDestroy 统一清理，避免残留。
  */
 class MappingService : Service() {
 
     private lateinit var wm: WindowManager
+    private val allViews = mutableListOf<View>()        // 跟踪所有悬浮 view，统一清理
     private var mainPanel: View? = null
+    private var floatBall: View? = null
     private val buttonViews = mutableListOf<KeyButtonView>()
     private var nextId = 1
     private var screenWidth = 1080
     private var screenHeight = 2400
     private var mappingStarted = false
+    private var inputStarted = false
+    private var driverName: String = ""
+    private lateinit var statusText: TextView           // 面板上的状态显示
 
-    // native 回调（物理按键）
+    // native 回调（物理按键，用于"待选择"绑定捕获）
     private val keyCallback = object : NativeBridge.KeyCallback {
         override fun onKeyEvent(code: Int, down: Boolean) {
-            // 仅在"待绑定"且按下时捕获
             if (down) {
                 val target = buttonViews.firstOrNull { it.waitingForBind }
                 if (target != null) {
@@ -63,9 +68,15 @@ class MappingService : Service() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val dm = DisplayMetrics()
-        wm.defaultDisplay.getRealMetrics(dm)
+        @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
         screenWidth = dm.widthPixels
         screenHeight = dm.heightPixels
+
+        // 服务启动即开始输入监听 → 绑定随时可用
+        NativeBridge.setKeyCallback(keyCallback)
+        val ndev = NativeBridge.nativeStartInput("")
+        inputStarted = ndev > 0
+        android.util.Log.i("Kma", "输入监听启动, 设备数=$ndev")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,10 +87,17 @@ class MappingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopMapping()
-        buttonViews.forEach { wm.removeView(it) }
+        // 停止映射 + 输入监听
+        if (mappingStarted) NativeBridge.nativeStopMapping()
+        if (inputStarted) NativeBridge.nativeStopInput()
+        // 统一移除所有悬浮 view（含面板、悬浮球、虚拟按键）
+        synchronized(allViews) {
+            allViews.toList().forEach { runCatching { wm.removeView(it) } }
+            allViews.clear()
+        }
         buttonViews.clear()
-        mainPanel?.let { wm.removeView(it) }
+        mainPanel = null
+        floatBall = null
     }
 
     // ── 主控悬浮窗 ──────────────────────────────────────
@@ -96,32 +114,45 @@ class MappingService : Service() {
             textSize = 16f
             setTextColor(0xFFFFFFFF.toInt())
         }
+        statusText = TextView(this).apply {
+            text = statusLine()
+            textSize = 12f
+            setTextColor(0xFFCCCCCC.toInt())
+            setPadding(0, 8, 0, 8)
+        }
         val btnCreate = Button(this).apply { text = "创建新按键" }
+        val btnDetect = Button(this).apply { text = "检测外设" }
         val btnStart = Button(this).apply { text = "开始映射" }
         val btnHide = Button(this).apply { text = "隐藏面板" }
 
         btnCreate.setOnClickListener { createNewButton() }
+        btnDetect.setOnClickListener { showDeviceList() }
         btnStart.setOnClickListener {
             if (mappingStarted) { stopMapping(); btnStart.text = "开始映射" }
             else { startMapping(); btnStart.text = "停止映射" }
         }
-        btnHide.setOnClickListener {
-            wm.removeView(panel); mainPanel = null
-            showFloatButton()
-        }
+        btnHide.setOnClickListener { hideMainPanel() }
 
         panel.addView(title)
+        panel.addView(statusText)
         panel.addView(btnCreate)
+        panel.addView(btnDetect)
         panel.addView(btnStart)
         panel.addView(btnHide)
-        panel.setBackgroundColor(0xCC222222.toInt())
+        panel.setBackgroundColor(0xDD222222.toInt())
 
-        wm.addView(panel, params)
+        addView(panel, params)
         mainPanel = panel
+    }
+
+    private fun hideMainPanel() {
+        mainPanel?.let { removeView(it); mainPanel = null }
+        showFloatButton()
     }
 
     /** 隐藏后的小悬浮球，点击恢复面板 */
     private fun showFloatButton() {
+        if (floatBall != null) return
         val ball = TextView(this).apply {
             text = "K"
             gravity = Gravity.CENTER
@@ -149,28 +180,31 @@ class MappingService : Service() {
                         if (abs(mx) > 10 || abs(my) > 10) { moved = true; lp.x = sx + mx; lp.y = sy + my; wm.updateViewLayout(v, lp) }
                     }
                     MotionEvent.ACTION_UP -> {
-                        if (!moved) { wm.removeView(v); showMainPanel() }
+                        if (!moved) { removeView(ball); floatBall = null; showMainPanel() }
                     }
                 }
                 return true
             }
         })
-        wm.addView(ball, lp)
+        addView(ball, lp)
+        floatBall = ball
     }
 
     // ── 虚拟按键管理 ────────────────────────────────────
     private fun createNewButton() {
+        if (!inputStarted) {
+            toast("输入监听未启动（需 root 读取 /dev/input）")
+            return
+        }
         val btn = KeyButton(id = nextId++, x = screenWidth / 2, y = screenHeight / 2)
         val view = KeyButtonView(this, btn)
         val lp = buttonParams(btn.x, btn.y)
 
         view.onClicked = { v ->
-            // 单击：进入待绑定
             buttonViews.forEach { it.waitingForBind = false }
             v.waitingForBind = true
             toast("按下要绑定的物理键...")
         }
-        view.onLongClicked = { v -> showTypePicker(v.button) }
         view.onDragged = { v, nx, ny ->
             v.button.x = nx; v.button.y = ny
             val clampedX = nx.coerceIn(v.width / 2, screenWidth - v.width / 2)
@@ -180,11 +214,9 @@ class MappingService : Service() {
             }
             wm.updateViewLayout(v, v.layoutParams)
         }
-        view.setOnLongClickListener {
-            showTypePicker(view.button); true
-        }
+        view.setOnLongClickListener { showTypePicker(view.button); true }
 
-        wm.addView(view, lp)
+        addView(view, lp)
         buttonViews.add(view)
         view.waitingForBind = true
         toast("新按键已创建，按下物理键绑定")
@@ -198,7 +230,6 @@ class MappingService : Service() {
             .setItems(names) { _, which ->
                 val actionCode = NativeBridge.ActionType.NAMES.keys.elementAt(which)
                 button.action = actionCode
-                // 类型特定参数
                 when (actionCode) {
                     NativeBridge.ActionType.REPEAT -> {
                         askNumber("连点间隔(ms)", button.extra.ifZero(50)) { v -> button.extra = v; refreshAndSync(button) }
@@ -216,9 +247,7 @@ class MappingService : Service() {
     }
 
     private fun refreshAndSync(button: KeyButton) {
-        buttonViews.firstOrNull { it.button.id == button.id }?.let {
-            it.text = button.label()
-        }
+        buttonViews.firstOrNull { it.button.id == button.id }?.let { it.text = button.label() }
         syncButton(button)
     }
 
@@ -226,38 +255,87 @@ class MappingService : Service() {
         val idx = buttonViews.indexOfFirst { it.button.id == button.id }
         if (idx >= 0) {
             val v = buttonViews.removeAt(idx)
-            wm.removeView(v)
-            if (button.isBound) NativeBridge.removeKeyMap(button.keyCode)
+            removeView(v)
+            if (button.isBound && mappingStarted) NativeBridge.removeKeyMap(button.keyCode)
         }
     }
 
     private fun syncButton(button: KeyButton) {
         if (!button.isBound) return
+        // 始终同步到 native（即使映射未启动，配置已就绪，启动后生效）
         NativeBridge.addKeyMap(button.keyCode, button.action, button.x, button.y, button.extra)
+    }
+
+    // ── 硬件检测 ────────────────────────────────────────
+    private fun showDeviceList() {
+        val text = NativeBridge.nativeGetDevices()
+        val devs = NativeBridge.parseDevices(text)
+        val sb = StringBuilder()
+        if (devs.isEmpty()) {
+            sb.append("未检测到键鼠外设\n（需 root 读取 /dev/input/event*）")
+        } else {
+            sb.append("检测到 ${devs.size} 个外设:\n\n")
+            devs.forEach {
+                sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n\n")
+            }
+        }
+        // 同时刷新面板状态
+        statusText.text = statusLine(devs.size)
+        AlertDialog.Builder(this)
+            .setTitle("外设检测")
+            .setMessage(sb.toString())
+            .setPositiveButton("确定", null)
+            .show()
     }
 
     // ── 映射开始/停止 ───────────────────────────────────
     private fun startMapping() {
-        // 同步所有已绑定按键到 native
-        NativeBridge.setKeyCallback(keyCallback)
-        val driverName = NativeBridge.nativeInit(screenWidth, screenHeight, NativeBridge.DriverType.AUTO, "")
+        // 1. 初始化驱动并反馈状态
+        driverName = NativeBridge.nativeInitDriver(screenWidth, screenHeight, NativeBridge.DriverType.AUTO)
         if (driverName.isEmpty()) {
-            toast("驱动初始化失败（需 root + 内核驱动）")
+            statusText.text = "驱动: ✗ 未对接\n(需 root + 内核驱动 twt/rt/qx/zero)"
+            toast("驱动初始化失败：未检测到内核驱动")
             return
         }
+        // 2. 同步所有已绑定按键
         buttonViews.forEach { syncButton(it.button) }
-        NativeBridge.startNative()
+        // 3. 启动映射
+        if (!NativeBridge.nativeStartMapping()) {
+            toast("映射启动失败")
+            return
+        }
         mappingStarted = true
+        val gyro = if (NativeBridge.hasGyro()) "支持陀螺仪" else "无陀螺仪"
+        statusText.text = "驱动: ✓ $driverName ($gyro)\n映射运行中"
         toast("映射已启动: $driverName")
     }
 
     private fun stopMapping() {
         if (!mappingStarted) return
-        NativeBridge.stopNative()
+        NativeBridge.nativeStopMapping()
         mappingStarted = false
+        statusText.text = statusLine()
+        toast("映射已停止（绑定仍可用）")
     }
 
     // ── 工具 ────────────────────────────────────────────
+    private fun statusLine(devCount: Int = -1): String {
+        val dc = if (devCount >= 0) devCount else NativeBridge.parseDevices(NativeBridge.nativeGetDevices()).size
+        val input = if (inputStarted) "输入:✓($dc 设备)" else "输入:✗"
+        val drv = if (mappingStarted) "驱动:✓ $driverName" else if (driverName.isNotEmpty()) "驱动:$driverName(未启动)" else "驱动:未对接"
+        return "$input\n$drv"
+    }
+
+    private fun addView(v: View, lp: WindowManager.LayoutParams) {
+        wm.addView(v, lp)
+        synchronized(allViews) { allViews.add(v) }
+    }
+
+    private fun removeView(v: View) {
+        runCatching { wm.removeView(v) }
+        synchronized(allViews) { allViews.remove(v) }
+    }
+
     private fun panelParams() = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,

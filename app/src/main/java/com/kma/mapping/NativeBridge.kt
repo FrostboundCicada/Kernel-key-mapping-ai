@@ -40,14 +40,53 @@ object NativeBridge {
 
     // --- JNI 方法 ---
     @JvmStatic external fun setKeyCallback(cb: KeyCallback)
-    @JvmStatic external fun nativeInit(screenW: Int, screenH: Int, driverType: Int, inputFilter: String): String
-    @JvmStatic external fun startNative(): Boolean
-    @JvmStatic external fun stopNative()
+
+    /** 启动输入监听（绑定用，服务启动即调用）。返回打开的设备数 */
+    @JvmStatic external fun nativeStartInput(inputFilter: String): Int
+    /** 停止输入监听 */
+    @JvmStatic external fun nativeStopInput()
+
+    /** 硬件检测：返回设备列表文本，每行 path|name|isKb|isMouse */
+    @JvmStatic external fun nativeGetDevices(): String
+
+    /** 驱动初始化（开始映射时）。返回驱动名/空串 */
+    @JvmStatic external fun nativeInitDriver(screenW: Int, screenH: Int, driverType: Int): String
+    @JvmStatic external fun hasGyro(): Boolean
+
+    /** 映射启停 */
+    @JvmStatic external fun nativeStartMapping(): Boolean
+    @JvmStatic external fun nativeStopMapping()
+
     @JvmStatic external fun addKeyMap(keyCode: Int, action: Int, x: Int, y: Int, extra: Int): Boolean
     @JvmStatic external fun removeKeyMap(keyCode: Int): Boolean
     @JvmStatic external fun clearKeyMaps()
     @JvmStatic external fun dumpKeyMaps(): String
     @JvmStatic external fun setMouseMode(mode: Int)
     @JvmStatic external fun setSensitivity(sens: Float, gyroSens: Float)
-    @JvmStatic external fun hasGyro(): Boolean
+
+    /** 已连接的输入设备信息 */
+    data class DeviceInfo(
+        val path: String, val name: String,
+        val isKeyboard: Boolean, val isMouse: Boolean
+    ) {
+        val type: String get() = when {
+            isKeyboard && isMouse -> "键鼠一体"
+            isKeyboard -> "键盘"
+            isMouse -> "鼠标"
+            else -> "其它"
+        }
+    }
+
+    /** 解析 nativeGetDevices() 返回的文本为设备列表 */
+    fun parseDevices(text: String): List<DeviceInfo> {
+        val list = mutableListOf<DeviceInfo>()
+        text.trim().split("\n").forEach { line ->
+            if (line.isBlank()) return@forEach
+            val p = line.split("|")
+            if (p.size >= 4) {
+                list.add(DeviceInfo(p[0], p[1], p[2] == "1", p[3] == "1"))
+            }
+        }
+        return list
+    }
 }
