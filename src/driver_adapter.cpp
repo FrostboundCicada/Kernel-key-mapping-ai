@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <linux/input.h>
 #include <random>
 #include <algorithm>
@@ -62,6 +63,46 @@ static const char* kInputHandleNodes[] = {
     "/dev/hakutaku",
 };
 
+// 扫描 /dev/ 发现所有可能的 touch 驱动节点（不依赖硬编码列表）。
+// 匹配关键词: touch / twt / rt / qx / zero / aim / hakutaku / ovo / input_handle
+// 排除系统标准设备（/dev/zero /dev/null 等）和 input/event 节点。
+static void scanDevTouchNodes(std::vector<std::string>& out) {
+    DIR* dir = opendir("/dev");
+    if (!dir) return;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        // 排除系统标准设备
+        if (name == "null" || name == "zero" || name == "full" ||
+            name == "random" || name == "urandom" || name == "kmsg" ||
+            name == "console" || name == "tty" || name == "ptmx") continue;
+        // 排除 input 子系统节点（这些是真实输入设备，不是注入驱动）
+        if (name.rfind("input/", 0) == 0) continue;
+        if (name.rfind("event", 0) == 0) continue;
+        // 关键词匹配（大小写不敏感）
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        bool match = false;
+        const char* keywords[] = {
+            "touch", "twt", "rt_touch", "rt_dev", "rt_hook", "rtdev",
+            "qx", "zero_touch", "aim", "hakutaku", "ovo", "input_handle",
+            "kma", "mapper", "inject"
+        };
+        for (auto kw : keywords) {
+            if (lower.find(kw) != std::string::npos) { match = true; break; }
+        }
+        if (!match) continue;
+        std::string full = "/dev/" + name;
+        // 确认是字符设备或可打开
+        if (access(full.c_str(), F_OK) == 0) {
+            out.push_back(full);
+        }
+    }
+    closedir(dir);
+}
+
 static std::mt19937& rng() {
     static std::mt19937 r{(uint32_t)(time(nullptr) ^ getpid())};
     return r;
@@ -82,35 +123,48 @@ TwtDriver::~TwtDriver() {
 // 通过 syscall(__NR_reboot) 携带 TwT magic 获取驱动 fd。
 // TwT 内核模块 hook 了 reboot 系统调用，识别 magic 后把 fd 写入 arg 指向地址。
 // 返回 fd(>=0) 或 -1（失败时 last_err_ 记录 errno）。
+// 尝试多种 magic 组合，兼容不同 twt 版本。
 int TwtDriver::syscallGetFd() {
 #if TWT_HAS_SYSCALL
-    int fd = -1;
-    errno = 0;
-    register long _x0 __asm__("x0") = 0x114514;
-    register long _x1 __asm__("x1") = 0x1919810;
-    register long _x2 __asm__("x2") = 0x2778;
-    register long _x3 __asm__("x3") = (long)&fd;
-    register long _x8 __asm__("x8") = __NR_reboot;
-    // 注意：x0 既是入参(magic1) 又是返回值，必须用 "+r"(read-write) 约束，
-    //       否则编译器可能把入参和返回值分配到不同寄存器，导致 syscall 看到的
-    //       magic1 不是 0x114514，TwT hook 不识别 → fd 不会被写入。
-    __asm__ __volatile__(
-        "svc #0"
-        : "+r"(_x0)
-        : "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x8)
-        : "memory", "cc"
-    );
-    long ret = _x0;
-    int saved_errno = errno;
-    if (fd >= 0) {
-        return fd;
+    // 已知 magic 组合（不同 twt 版本可能不同）
+    struct MagicCombo { long m1, m2, m3; const char* desc; };
+    static const MagicCombo combos[] = {
+        {0x114514, 0x1919810, 0x2778,  "经典 TwT (0x114514/0x1919810/0x2778)"},
+        {0x114514, 0x1919810, 0x114,   "TwT 变体1 (0x114514/0x1919810/0x114)"},
+        {0x1919810, 0x114514, 0x2778,  "TwT 变体2 (m1/m2 互换)"},
+        {0x2778, 0x114514, 0x1919810,  "TwT 变体3"},
+    };
+
+    std::string all_errs;
+    for (const auto& mc : combos) {
+        int fd = -1;
+        errno = 0;
+        register long _x0 __asm__("x0") = mc.m1;
+        register long _x1 __asm__("x1") = mc.m2;
+        register long _x2 __asm__("x2") = mc.m3;
+        register long _x3 __asm__("x3") = (long)&fd;
+        register long _x8 __asm__("x8") = __NR_reboot;
+        // x0 既是入参(magic1) 又是返回值，必须用 "+r"(read-write) 约束
+        __asm__ __volatile__(
+            "svc #0"
+            : "+r"(_x0)
+            : "r"(_x1), "r"(_x2), "r"(_x3), "r"(_x8)
+            : "memory", "cc"
+        );
+        long ret = _x0;
+        int saved_errno = errno;
+        if (fd >= 0) {
+            last_err_.clear();
+            return fd;
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "  [%s] ret=%ld errno=%d:%s",
+                 mc.desc, ret, saved_errno, strerror(saved_errno));
+        all_errs += buf;
+        all_errs += "\n";
     }
-    // fd 未被写入 → TwT hook 没有接管这次 reboot 调用
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-             "syscall(__NR_reboot) 未被 TwT hook 接管 (ret=%ld errno=%d:%s)",
-             ret, saved_errno, strerror(saved_errno));
-    last_err_ = buf;
+    last_err_ = "所有 TwT magic 组合均未被 hook 接管:\n" + all_errs;
     return -1;
 #else
     last_err_ = "非 aarch64 架构，不支持 TwT syscall 对接";
@@ -246,18 +300,46 @@ InputHandleDriver::~InputHandleDriver() {
 bool InputHandleDriver::open(int screen_w, int screen_h) {
     screen_w_ = screen_w;
     screen_h_ = screen_h;
+
+    // 1) 先尝试硬编码已知节点（精确匹配）
     for (const char* path : kInputHandleNodes) {
         int fd = ::open(path, O_WRONLY);
         if (fd >= 0) {
             fd_ = fd;
-            // 提取名字用于日志
             const char* base = strrchr(path, '/');
             name_ = base ? base + 1 : path;
-            // 发送 INIT（部分驱动需要，失败可忽略）
             AimTouchInit init{screen_w, screen_h};
             ioctl(fd_, AIM_TOUCH_INIT, &init);
             return true;
         }
+    }
+    // 2) 扫描 /dev/ 发现所有 touch 相关节点，逐个尝试 ioctl 'A' 探测
+    std::vector<std::string> discovered;
+    scanDevTouchNodes(discovered);
+    for (const auto& path : discovered) {
+        // 跳过已尝试的硬编码节点
+        bool already = false;
+        for (const char* k : kInputHandleNodes) {
+            if (path == k) { already = true; break; }
+        }
+        if (already) continue;
+        int fd = ::open(path.c_str(), O_WRONLY);
+        if (fd < 0) {
+            // 试试读写模式
+            fd = ::open(path.c_str(), O_RDWR);
+            if (fd < 0) continue;
+        }
+        // 用 AIM_TOUCH_INIT 探测是否是 aim_touch 风格驱动
+        AimTouchInit init{screen_w, screen_h};
+        int ret = ioctl(fd, AIM_TOUCH_INIT, &init);
+        // 即使 INIT 返回错误，也尝试 DOWN/UP 探测（有些驱动不需要 INIT）
+        if (ret == 0 || errno != ENOTTY) {
+            fd_ = fd;
+            const char* base = strrchr(path.c_str(), '/');
+            name_ = base ? base + 1 : path;
+            return true;
+        }
+        close(fd);
     }
     return false;
 }
@@ -341,12 +423,55 @@ ITouchDriver* DriverManager::probe(DriverType preferred, int screen_w, int scree
         }
         diagAppend(any ? nodes : nodes + "(无)");
     }
+    {
+        // 扫描 /dev/ 发现所有 touch 相关节点
+        std::vector<std::string> discovered;
+        scanDevTouchNodes(discovered);
+        diagAppend("扫描 /dev/ 发现的 touch 相关节点:");
+        if (discovered.empty()) {
+            diagAppend("  (无)");
+        } else {
+            for (const auto& p : discovered) {
+                // 显示节点权限
+                std::string perm;
+                struct stat st;
+                if (stat(p.c_str(), &st) == 0) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%o", st.st_mode & 0777);
+                    perm = std::string(" (权限=") + buf + ")";
+                }
+                diagAppend("  " + p + perm);
+            }
+        }
+    }
+    {
+        // 读取 /proc/bus/input/devices 摘要（前 40 行，看有没有 twt/rt 相关输入设备）
+        FILE* fp = fopen("/proc/bus/input/devices", "r");
+        if (fp) {
+            diagAppend("/proc/bus/input/devices 摘要:");
+            char line[512];
+            int n = 0;
+            while (fgets(line, sizeof(line), fp) && n < 40) {
+                // 只显示 Name 和 Handlers 行
+                if (strstr(line, "Name=") || strstr(line, "Handlers=") ||
+                    strstr(line, "twt") || strstr(line, "rt_") || strstr(line, "touch")) {
+                    std::string s(line);
+                    if (!s.empty() && s.back() == '\n') s.pop_back();
+                    diagAppend("  " + s);
+                    ++n;
+                }
+            }
+            fclose(fp);
+        } else {
+            diagAppend("/proc/bus/input/devices: 无法读取");
+        }
+    }
 
     auto tryTwt = []() -> ITouchDriver* {
         diagAppend("[尝试 TwT]");
         auto* d = new TwtDriver();
         if (d->open()) {
-            diagAppend("  TwT open() 成功, fd=" + std::to_string(0));
+            diagAppend("  TwT open() 成功");
             // 尝试触摸方案二（方案一已被部分游戏特征）
             if (!d->touchInit(1)) {
                 diagAppend("  touchInit(1) 失败, 尝试 (0)");
@@ -384,6 +509,11 @@ ITouchDriver* DriverManager::probe(DriverType preferred, int screen_w, int scree
         if (auto* d = tryInputHandle()) return d;
     }
     diagAppend("=== 所有驱动均未对接 ===");
+    diagAppend("提示: 请确认");
+    diagAppend("  1. 内核模块已 insmod (lsmod 检查)");
+    diagAppend("  2. /dev/ 下存在对应节点 (上方扫描结果)");
+    diagAppend("  3. 节点权限 666 (root 执行 chmod 666 /dev/*_touch)");
+    diagAppend("  4. SELinux 未拦截 (root 执行 setenforce 0 测试)");
     return nullptr;
 }
 

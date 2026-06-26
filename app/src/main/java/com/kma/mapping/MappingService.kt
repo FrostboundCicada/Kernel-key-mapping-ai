@@ -313,28 +313,45 @@ class MappingService : Service() {
             val sb = StringBuilder()
             sb.append("Root: ${if (rootGranted) "✓ 已授权" else "✗ 未授权"}\n")
             sb.append("输入监听: ${if (inputStarted) "✓ 运行中" else "✗ 未启动"}\n\n")
+
+            // 1) 键鼠外设（/dev/input/event*）
+            sb.append("=== 键鼠外设 (/dev/input/event*) ===\n")
             if (devs.isEmpty()) {
-                sb.append("native 扫描未发现键鼠外设\n\n")
-                // 用 root 命令补充诊断
+                sb.append("(未检测到键盘/鼠标)\n")
                 if (rootGranted) {
-                    sb.append("=== /dev/input/event* (root) ===\n")
+                    sb.append("原始节点列表:\n")
                     sb.append(RootShell.listInputNodes())
-                    sb.append("\n=== lsmod (含 twt?) ===\n")
-                    sb.append(RootShell.listModules().lines().filter {
-                        it.contains("twt", ignoreCase = true) ||
-                        it.contains("touch", ignoreCase = true) ||
-                        it.contains("input", ignoreCase = true)
-                    }.joinToString("\n").ifEmpty { "(未找到 twt/touch/input 相关模块)" })
                 }
             } else {
-                sb.append("检测到 ${devs.size} 个外设:\n\n")
                 devs.forEach {
-                    sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n\n")
+                    sb.append("• [${it.type}] ${it.name}\n  ${it.path}\n")
                 }
             }
+            sb.append("\n")
+
+            // 2) 触摸驱动节点（/dev/twt /dev/*_touch 等）— 这是用户刷入的内核驱动节点
+            sb.append("=== 触摸驱动节点 (/dev/*_touch /dev/twt 等) ===\n")
+            val touchNodes = RootShell.exec(
+                "ls -la /dev/ 2>/dev/null | grep -iE 'touch|twt|rt_|rtdev|qx|zero|aim|hakutaku|ovo|input_handle|inject' | grep -v 'input/' || echo '(无触摸驱动节点)'"
+            )
+            sb.append(touchNodes)
+            sb.append("\n")
+
+            // 3) 内核模块
+            sb.append("=== 已加载的相关内核模块 ===\n")
+            val mods = RootShell.listModules()
+            val touchMods = mods.lines().filter {
+                it.contains("twt", true) || it.contains("touch", true) ||
+                it.contains("aim", true) || it.contains("rt_", true) ||
+                it.contains("rt_dev", true) || it.contains("rt_hook", true) ||
+                it.contains("qx", true) || it.contains("zero", true) ||
+                it.contains("hakutaku", true) || it.contains("ovo", true)
+            }
+            sb.append(touchMods.joinToString("\n").ifEmpty { "(未找到相关模块)" })
+
             mainHandler.post {
                 refreshStatus(devs.size)
-                showOverlayMessage("外设检测", sb.toString())
+                showOverlayMessageWithCopy("外设检测", sb.toString())
             }
         }.start()
     }
@@ -346,24 +363,42 @@ class MappingService : Service() {
             sb.append("=== 环境检查 ===\n")
             sb.append("Root: ${if (rootGranted) "✓" else "✗"}\n")
             sb.append("屏幕: ${screenWidth}x${screenHeight}\n")
-            sb.append("架构: ${Build.SUPPORTED_ABIS.joinToString(",")}\n\n")
+            sb.append("架构: ${Build.SUPPORTED_ABIS.joinToString(",")}\n")
+            sb.append("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
+            sb.append("设备: ${Build.MANUFACTURER} ${Build.MODEL}\n\n")
 
-            sb.append("=== 内核模块 (lsmod) ===\n")
-            val mods = RootShell.listModules()
-            val touchMods = mods.lines().filter {
-                it.contains("twt", ignoreCase = true) ||
-                it.contains("touch", ignoreCase = true) ||
-                it.contains("aim", ignoreCase = true) ||
-                it.contains("rt_", ignoreCase = true) ||
-                it.contains("qx_", ignoreCase = true) ||
-                it.contains("zero", ignoreCase = true)
-            }
-            sb.append(touchMods.joinToString("\n").ifEmpty { "(未找到 twt/touch/aim/rt/qx/zero 相关模块)" })
+            sb.append("=== SELinux 状态 ===\n")
+            sb.append(RootShell.exec("getenforce 2>/dev/null || echo '无法读取'"))
             sb.append("\n\n")
 
-            sb.append("=== /dev 驱动节点 ===\n")
-            val nodes = RootShell.exec("ls -la /dev/twt* /dev/aim_touch /dev/rt_touch /dev/qx_touch /dev/zero_touch /dev/ovo_touch /dev/hakutaku 2>/dev/null || echo '(无已知驱动节点)'")
-            sb.append(nodes)
+            sb.append("=== 内核模块 (lsmod 完整) ===\n")
+            val mods = RootShell.listModules()
+            // 显示完整 lsmod，但标注 touch 相关行
+            mods.lines().forEach { line ->
+                if (line.isBlank()) return@forEach
+                val isTouchRelated = line.contains("twt", true) ||
+                    line.contains("touch", true) ||
+                    line.contains("aim", true) ||
+                    line.contains("rt_", true) ||
+                    line.contains("rt_dev", true) ||
+                    line.contains("rt_hook", true) ||
+                    line.contains("qx_", true) ||
+                    line.contains("zero", true) ||
+                    line.contains("hakutaku", true) ||
+                    line.contains("ovo", true)
+                sb.append(if (isTouchRelated) "▶ $line\n" else "$line\n")
+            }
+            sb.append("\n")
+
+            sb.append("=== /dev 下所有 touch/twt/rt 相关节点 ===\n")
+            // 用 root 列出 /dev 下所有可能节点（不只已知列表）
+            sb.append(RootShell.exec(
+                "ls -la /dev/ 2>/dev/null | grep -iE 'touch|twt|rt_|rtdev|qx|zero|aim|hakutaku|ovo|input_handle|inject|mapper' || echo '(无)'"
+            ))
+            sb.append("\n")
+
+            sb.append("=== /proc/bus/input/devices ===\n")
+            sb.append(RootShell.exec("cat /proc/bus/input/devices 2>/dev/null | head -80"))
             sb.append("\n\n")
 
             sb.append("=== native 驱动探测日志 ===\n")
@@ -374,13 +409,20 @@ class MappingService : Service() {
             sb.append(NativeBridge.nativeDiagnoseDriver())
             sb.append("\n")
 
+            // 关键修复：探测成功后同步更新 driverName，避免状态栏仍显示"未对接"
+            // 而 startMapping 又能成功的状态不一致问题
+            if (drv.isNotEmpty()) {
+                driverName = drv
+            }
+
             if (drv.isEmpty()) {
-                sb.append("=== dmesg 末尾 (root) ===\n")
-                sb.append(RootShell.dmesgTail(20))
+                sb.append("=== dmesg 末尾 30 行 (root) ===\n")
+                sb.append(RootShell.dmesgTail(30))
             }
 
             mainHandler.post {
-                showOverlayMessage("驱动诊断", sb.toString())
+                refreshStatus()
+                showOverlayMessageWithCopy("驱动诊断", sb.toString())
             }
         }.start()
     }
@@ -393,15 +435,16 @@ class MappingService : Service() {
             val diag = NativeBridge.nativeDiagnoseDriver()
             statusText.text = "驱动: ✗ 未对接\n(点「驱动诊断」查看详情)"
             toast("驱动初始化失败")
-            // 自动弹出诊断
-            showOverlayMessage(
+            // 自动弹出诊断（带复制按钮，方便用户反馈）
+            showOverlayMessageWithCopy(
                 "驱动未对接",
                 "驱动探测失败，诊断日志:\n\n$diag\n\n" +
                 "可能原因:\n" +
                 "1. twt 模块未加载 → root 执行 insmod twt.ko\n" +
                 "2. /dev/*_touch 节点权限不足 → 已自动 chmod，若仍失败请检查 SELinux\n" +
                 "3. TwT syscall 未被 hook → 确认 twt 模块版本与 magic 一致\n" +
-                "4. 非 aarch64 架构 → TwT 仅支持 arm64"
+                "4. 非 aarch64 架构 → TwT 仅支持 arm64\n\n" +
+                "请点「复制全部」把诊断信息发给我"
             )
             return
         }
@@ -429,6 +472,11 @@ class MappingService : Service() {
     // ── overlay 对话框（替代 AlertDialog，避免 BadTokenException）────
     /** 显示消息型 overlay 对话框 */
     private fun showOverlayMessage(title: String, message: String) {
+        showOverlayMessageWithCopy(title, message, showCopy = false)
+    }
+
+    /** 显示消息型 overlay 对话框（带复制按钮） */
+    private fun showOverlayMessageWithCopy(title: String, message: String, showCopy: Boolean = true) {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(32, 24, 32, 24)
@@ -440,6 +488,7 @@ class MappingService : Service() {
         val msgView = TextView(this).apply {
             text = message; textSize = 12f; setTextColor(0xFFDDDDDD.toInt())
             setLineSpacing(2f, 1f)
+            setTextIsSelectable(true)
         }
         val scroll = ScrollView(this).apply { addView(msgView) }
         val btnRow = LinearLayout(this).apply {
@@ -447,6 +496,58 @@ class MappingService : Service() {
             setPadding(0, 16, 0, 0)
         }
         val btnClose = Button(this).apply { text = "关闭" }
+        btnRow.addView(btnClose, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (showCopy) {
+            val btnCopy = Button(this).apply {
+                text = "复制"
+                setOnClickListener {
+                    val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("kma_diag", message))
+                    toast("已复制到剪贴板")
+                }
+            }
+            btnRow.addView(btnCopy, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        container.addView(titleView)
+        container.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        container.addView(btnRow)
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            windowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        btnClose.setOnClickListener { removeView(container) }
+        addView(container, lp)
+    }
+
+    /** 显示消息型 overlay 对话框（带复制按钮，方便用户分享诊断信息） */
+    private fun showOverlayMessageWithCopy(title: String, message: String) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 24, 32, 24)
+            setBackgroundColor(0xEE333333.toInt())
+        }
+        val titleView = TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(0xFFFFFFFF.toInt()); setPadding(0, 0, 0, 16)
+        }
+        val msgView = TextView(this).apply {
+            text = message; textSize = 12f; setTextColor(0xFFDDDDDD.toInt())
+            setLineSpacing(2f, 1f)
+            // 文本可选中复制
+            setTextIsSelectable(true)
+        }
+        val scroll = ScrollView(this).apply { addView(msgView) }
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 16, 0, 0)
+        }
+        val btnCopy = Button(this).apply { text = "复制全部" }
+        val btnClose = Button(this).apply { text = "关闭" }
+        btnRow.addView(btnCopy, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         btnRow.addView(btnClose, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(titleView)
         container.addView(scroll, LinearLayout.LayoutParams(
@@ -460,6 +561,11 @@ class MappingService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
+        btnCopy.setOnClickListener {
+            val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("kma_diag", message))
+            toast("已复制到剪贴板")
+        }
         btnClose.setOnClickListener { removeView(container) }
         addView(container, lp)
     }
