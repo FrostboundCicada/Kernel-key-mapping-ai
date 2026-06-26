@@ -16,12 +16,14 @@ import java.util.concurrent.TimeUnit
 object RootShell {
 
     /** 是否已获得 root（su 可用且返回 uid=0） */
-    fun hasRoot(): Boolean = try {
-        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "id -u"))
-        val finished = p.waitFor(5, TimeUnit.SECONDS)
-        if (!finished) { p.destroy(); return false }
-        p.inputStream.bufferedReader().readText().trim() == "0"
-    } catch (e: Exception) { false }
+    fun hasRoot(): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "id -u"))
+            val finished = p.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) { p.destroy(); false }
+            else p.inputStream.bufferedReader().readText().trim() == "0"
+        } catch (e: Exception) { false }
+    }
 
     /** 执行命令，返回 stdout+stderr 合并文本 */
     fun exec(cmd: String, timeoutSec: Long = 10): String = try {
