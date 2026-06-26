@@ -1,29 +1,23 @@
 // mapper.h — 键鼠 → 触摸/陀螺仪 映射引擎
 //
-// 配置模型：
-//   1. 按键映射：每个按键码(KEY_W / BTN_LEFT 等) → 一个映射项
-//      - click : 按下时点击一次屏幕坐标，松开不动作
-//      - hold  : 按下持续触摸该坐标，松开抬起
-//      - toggle: 按下切换该坐标的触摸状态（再按一次抬起）
-//   2. 鼠标移动：
-//      - drag  : 鼠标相对位移直接驱动一个触摸点拖拽（用于压枪/拖动准星）
-//      - gyro  : 鼠标位移转陀螺仪角速度（仅 TWT 后端，FPS 视角转动）
-//   3. 鼠标左/右键同样可作为按键映射到屏幕坐标（开火/瞄准）
+// 按键类型（KeyAction）:
+//   CLICK     单击：按下时点击一次屏幕坐标，松开不动作
+//   HOLD      长按：按下持续触摸该坐标，松开抬起
+//   TOGGLE    锁定切换：按一次切换触摸状态（再按一次抬起）
+//   REPEAT    连点：按住时以 repeat_ms 间隔连续点击该坐标
+//   MOVE      移动：拖拽触点（配合鼠标位移驱动该点，压枪/拖动准星）
+//   JOYSTICK  摇杆：以 (x,y) 为中心、radius 为半径的虚拟摇杆，
+//             按住后可向各方向拖动，松开回中
+//   WHEEL     轮盘：按住显示方向选项，向 8 方向拖动选择对应坐标
+//   SENSITIVITY 灵敏度调节：按住增减(toggle 方向)全局灵敏度
+//
+// 鼠标移动（全局 mouse_mode）:
+//   drag  : 鼠标相对位移直接驱动一个触摸点拖拽
+//   gyro  : 鼠标位移转陀螺仪角速度（仅 TWT 后端，FPS 视角转动）
 //
 // Slot 分配：
-//   每个 hold/toggle 按键占用一个 slot。click 不占用长时 slot。
+//   HOLD/TOGGLE/REPEAT/MOVE/JOYSTICK 按键占用一个 slot。CLICK 不占长时 slot。
 //   TWT 支持多 slot；aim_touch 风格单 slot，后按下者抢占。
-//
-// 配置文件格式（简洁文本，每行一条）：
-//   screen <w> <h>
-//   driver auto|twt|input
-//   mouse_mode drag|gyro
-//   sensitivity <float>
-//   gyro_sensitivity <float>
-//   key <KEY_NAME> click|hold|toggle <x> <y>
-//   mouse_left click|hold|toggle <x> <y>
-//   mouse_right click|hold|toggle <x> <y>
-//   # 注释行
 #pragma once
 
 #include "driver_adapter.h"
@@ -35,12 +29,25 @@
 
 namespace kma {
 
-enum class KeyAction : int { CLICK, HOLD, TOGGLE };
+enum class KeyAction : int {
+    CLICK = 0,       // 单击
+    HOLD = 1,        // 长按
+    TOGGLE = 2,      // 锁定切换
+    REPEAT = 3,      // 连点
+    MOVE = 4,        // 移动(拖拽触点)
+    JOYSTICK = 5,    // 摇杆
+    WHEEL = 6,       // 轮盘
+    SENSITIVITY = 7, // 灵敏度调节
+};
 
 struct KeyMap {
-    int code;           // KEY_xxx / BTN_LEFT / BTN_RIGHT
-    KeyAction action;
-    int x, y;           // 屏幕坐标
+    int code = 0;          // KEY_xxx / BTN_LEFT / BTN_RIGHT
+    KeyAction action = KeyAction::HOLD;
+    int x = 0, y = 0;      // 主坐标（摇杆中心 / 轮盘中心 / 点击位置）
+    int repeat_ms = 50;    // REPEAT 连点间隔（毫秒）
+    int radius = 120;      // JOYSTICK 摇杆半径
+    // WHEEL 8 方向目标坐标（顺时针 0=上 1=右上 ... 7=左上），未设为 -1
+    int wheel_dirs[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
 };
 
 enum class MouseMode : int { DRAG, GYRO };
@@ -102,14 +109,21 @@ private:
 
     // slot 管理：按键码 → slot
     int next_slot_ = 0;
-    std::unordered_map<int, int> active_held_;   // code → slot（hold/toggle 活跃）
-    // 拖拽用 slot
+    std::unordered_map<int, int> active_held_;   // code → slot（hold/toggle/move/joystick 活跃）
+    // 拖拽用 slot（全局鼠标 MOVE 模式 或 MOVE 类型按键）
     int drag_slot_ = -1;
     int drag_x_ = 0, drag_y_ = 0;
     bool drag_active_ = false;
 
+    // REPEAT 连点状态：code → {slot, 上次点击时间戳(ms)}
+    struct RepeatState { int slot; int64_t last_click_ms; };
+    std::unordered_map<int, RepeatState> repeat_active_;
+
     // gyro 累积速度（用于平滑/衰减）
     float gyro_vx_ = 0, gyro_vy_ = 0;
+
+    // 当前时间戳(ms)
+    static int64_t nowMs();
 
     // 查找按键映射
     const KeyMap* findKey(int code) const;

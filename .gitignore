@@ -5,3 +5,12 @@ build/
 kma_mapper
 .idea/
 .vscode/
+
+# Android / Gradle
+local.properties
+.gradle/
+app/build/
+build/
+*.iml
+.idea/
+captures/
